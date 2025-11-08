@@ -1,0 +1,688 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+
+// === NEW IMPORT ===
+import StarryBackground from './components/StarryBackground';
+
+// Firebase Imports (Mandatory: use specific URLs for browser compatibility)
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, collection, query, onSnapshot, addDoc, deleteDoc, Timestamp } from 'firebase/firestore';
+
+// --- GLOBAL VARIABLES & INITIALIZATION (Mandatory) ---
+// These variables are expected to be available in the execution environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+// --------------------------------------------------------
+
+/**
+ * Utility to extract the domain from a URL for better visual grouping.
+ * @param {string} url 
+ * @returns {string} The domain name (e.g., example.com)
+ */
+const getDomain = (url) => {
+  try {
+    const urlObj = new URL(url);
+    return urlObj.hostname.replace(/^www\./, '');
+  } catch (e) {
+    return 'Invalid URL';
+  }
+};
+
+/**
+ * The main application component for managing and tracking web platforms.
+ */
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // Form State
+  const [newUrl, setNewUrl] = useState('');
+  const [newTitle, setNewTitle] = useState('');
+  const [newNote, setNewNote] = useState('');
+  const [newTagsString, setNewTagsString] = useState('');
+  const [isAdding, setIsAdding] = useState(false);
+
+  // Link List State
+  const [links, setLinks] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  // Filter/Search State
+  const [searchTerm, setSearchTerm] = useState('');
+
+  // GEMINI API State for Insight Modal
+  const [insightModal, setInsightModal] = useState({
+    isOpen: false,
+    isLoading: false,
+    content: null,
+    error: null,
+    title: '',
+  });
+
+  // Confirmation Modal State for Deletion (NEW)
+  const [confirmModal, setConfirmModal] = useState({
+    isOpen: false,
+    linkToDelete: null,
+  });
+
+  // 1. Firebase Initialization and Authentication
+  useEffect(() => {
+    if (Object.keys(firebaseConfig).length === 0) {
+      setError('Firebase configuration is missing.');
+      return;
+    }
+
+    try {
+      const firebaseApp = initializeApp(firebaseConfig);
+      const firestoreDb = getFirestore(firebaseApp);
+      const firebaseAuth = getAuth(firebaseApp);
+
+      setDb(firestoreDb);
+      setAuth(firebaseAuth);
+
+      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (!user) {
+          if (initialAuthToken) {
+            await signInWithCustomToken(firebaseAuth, initialAuthToken);
+          } else {
+            // Sign in anonymously if no token is available
+            await signInAnonymously(firebaseAuth);
+          }
+        }
+        // User (authenticated or anonymous) is now available
+        setUserId(firebaseAuth.currentUser?.uid || 'anonymous-user');
+        setIsAuthReady(true);
+      });
+
+      return () => unsubscribe();
+    } catch (e) {
+      console.error('Firebase initialization error:', e);
+      setError('Failed to initialize application services.');
+    }
+  }, []);
+
+  // 2. Real-time Data Fetching (onSnapshot)
+  useEffect(() => {
+    if (!db || !isAuthReady || !userId) return;
+
+    // Data path: Private data for this user
+    const collectionPath = `/artifacts/${appId}/users/${userId}/saved_platforms`;
+    const linksCollectionRef = collection(db, collectionPath);
+    
+    // NOTE: Avoiding orderBy() as per best practices to prevent runtime index errors
+    const q = query(linksCollectionRef);
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedLinks = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data(),
+            // Ensure tags is always an array
+            tags: Array.isArray(doc.data().tags) ? doc.data().tags : [],
+            // Convert Firestore Timestamp to JS Date for local sorting/display
+            createdAt: doc.data().createdAt?.toDate() || new Date()
+        }));
+        
+        // Client-side sort by newest first
+        fetchedLinks.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+        
+        setLinks(fetchedLinks);
+        setIsLoading(false);
+    }, (err) => {
+        console.error('Firestore snapshot error:', err);
+        setError('Failed to load links in real-time.');
+        setIsLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [db, isAuthReady, userId, appId]);
+
+  // 3. Link Saving Function
+  const handleAddLink = useCallback(async (e) => {
+    e.preventDefault();
+    if (!db || !userId || !newUrl.trim()) {
+      setError('Please ensure you are signed in and have entered a URL.');
+      return;
+    }
+
+    try {
+      new URL(newUrl); // Basic URL validation
+    } catch {
+      setError('The URL format is invalid.');
+      return;
+    }
+
+    setIsAdding(true);
+    setError(null);
+
+    const tagsArray = newTagsString.toLowerCase()
+      .split(',')
+      .map(tag => tag.trim())
+      .filter(tag => tag.length > 0);
+
+    const linkData = {
+      url: newUrl.trim(),
+      title: newTitle.trim() || newUrl.trim(),
+      note: newNote.trim(), 
+      domain: getDomain(newUrl),
+      tags: tagsArray,
+      createdAt: Timestamp.now(),
+      userId: userId,
+    };
+
+    try {
+      const collectionPath = `/artifacts/${appId}/users/${userId}/saved_platforms`;
+      await addDoc(collection(db, collectionPath), linkData);
+      
+      // Clear form after successful submission
+      setNewUrl('');
+      setNewTitle('');
+      setNewNote(''); 
+      setNewTagsString('');
+    } catch (e) {
+      console.error('Error adding document: ', e);
+      setError('Failed to save link. Check console for details.');
+    } finally {
+      setIsAdding(false);
+    }
+  }, [db, userId, newUrl, newTitle, newNote, newTagsString, appId]);
+
+  // 4a. Link Deletion Initiation (Opens Modal)
+  const handleDeleteLink = useCallback((link) => {
+    if (!db || !userId) {
+        setError('Cannot perform delete: User not authenticated or database not ready.');
+        return;
+    }
+    // Open custom modal
+    setConfirmModal({
+      isOpen: true,
+      linkToDelete: link,
+    });
+  }, [db, userId]);
+
+  // 4b. Link Deletion Confirmation (Executes Delete)
+  const handleConfirmDelete = useCallback(async () => {
+    if (!confirmModal.linkToDelete) return;
+
+    const linkId = confirmModal.linkToDelete.id;
+    
+    // Close modal immediately
+    setConfirmModal({ isOpen: false, linkToDelete: null });
+    
+    const docPath = `/artifacts/${appId}/users/${userId}/saved_platforms/${linkId}`;
+    console.log("Attempting to delete document at path:", docPath); 
+
+    try {
+      await deleteDoc(doc(db, docPath));
+      console.log("Document successfully deleted.");
+      // Clear any prior errors if the delete was successful
+      setError(null); 
+    } catch (e) {
+      console.error('Error deleting document:', e); 
+      
+      let displayError;
+      if (e.message.includes('permission-denied')) {
+        // This is the most common failure reason in this environment
+        displayError = "Deletion failed: Permission Denied. Please try refreshing the page and attempting the action again.";
+      } else {
+        displayError = `Deletion failed. Check console for details. (Error: ${e.message})`;
+      }
+
+      setError(displayError);
+    }
+  }, [confirmModal, db, userId, appId]);
+  
+  // 5. GEMINI API Insight Generator (New Feature)
+  const handleGenerateInsight = useCallback(async (link) => {
+    setInsightModal({ isOpen: true, isLoading: true, content: null, error: null, title: link.title });
+
+    const userQuery = `Platform: ${link.title}. My Note: "${link.note}". Generate a concise, 2-sentence purpose summary and one specific, useful action item.`;
+    const systemPrompt = "You are an AI assistant specialized in web platform analysis. Based on the provided link title and user's note, generate two concise, separate items: 1) A 2-sentence summary of the platform's purpose, and 2) One specific, useful action item a user should take next (e.g., 'Set up weekly sync,' 'Integrate with X tool,' 'Review privacy settings'). Format the output strictly as a single Markdown block using bolding for titles and a markdown list.";
+
+    const apiKey = ""; // Leave as-is
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+    const payload = {
+        contents: [{ parts: [{ text: userQuery }] }],
+        tools: [{ "google_search": {} }], // Enable grounding
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+    };
+
+    let attempt = 0;
+    const maxRetries = 3;
+
+    while (attempt < maxRetries) {
+        try {
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const result = await response.json();
+            const candidate = result.candidates?.[0];
+
+            if (candidate && candidate.content?.parts?.[0]?.text) {
+                const text = candidate.content.parts[0].text;
+                
+                let sources = [];
+                const groundingMetadata = candidate.groundingMetadata;
+                if (groundingMetadata && groundingMetadata.groundingAttributions) {
+                    sources = groundingMetadata.groundingAttributions
+                        .map(attribution => ({
+                            uri: attribution.web?.uri,
+                            title: attribution.web?.title,
+                        }))
+                        .filter(source => source.uri && source.title);
+                }
+
+                setInsightModal(prev => ({ 
+                    ...prev,
+                    isLoading: false, 
+                    content: { text, sources }, 
+                    error: null 
+                }));
+                return; // Success
+            } else {
+                throw new Error("No content generated by the model.");
+            }
+        } catch (e) {
+            console.error(`Attempt ${attempt + 1} failed:`, e);
+            attempt++;
+            if (attempt < maxRetries) {
+                const delay = Math.pow(2, attempt) * 1000;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                setInsightModal(prev => ({
+                    ...prev,
+                    isLoading: false,
+                    content: null,
+                    error: `Failed to generate insight after ${maxRetries} attempts. ${e.message}`
+                }));
+            }
+        }
+    }
+  }, []);
+
+  // 6. Filtered List Logic
+  const filteredLinks = useMemo(() => {
+    const term = searchTerm.toLowerCase().trim();
+    if (!term) return links;
+
+    return links.filter(link => 
+      link.title.toLowerCase().includes(term) ||
+      link.url.toLowerCase().includes(term) ||
+      link.note?.toLowerCase().includes(term) || 
+      link.domain.toLowerCase().includes(term) ||
+      link.tags.some(tag => tag.includes(term))
+    );
+  }, [links, searchTerm]);
+
+
+  // --- UI Components ---
+  
+  // Minimal component to render the markdown output
+  const InsightContent = ({ content }) => {
+    if (insightModal.isLoading) {
+        return (
+            <div className="flex justify-center items-center h-48">
+                <svg className="animate-spin h-8 w-8 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span className="ml-3 text-lg text-gray-600">Generating Insight...</span>
+            </div>
+        );
+    }
+    
+    if (insightModal.error) {
+        return <p className="text-red-600 text-sm">Error: {insightModal.error}</p>;
+    }
+
+    if (!content || !content.text) return null;
+
+    // Basic Markdown to HTML conversion for strong and lists
+    let html = content.text;
+    html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    // Simple list item conversion
+    html = html.replace(/^- (.*)/gm, '<li>$1</li>');
+
+    // Wrap list items if they exist
+    if (html.includes('<li>')) {
+        html = `<ul>${html}</ul>`;
+        html = html.replace(/<\/ul>\s*<ul>/g, '').replace(/<\/li>\s*<li>/g, '</li><li>');
+    }
+    
+    // Clean up empty lines/extra spaces
+    html = html.replace(/(\r\n|\n|\r)/gm, '').trim();
+
+    return (
+        <div className="text-sm space-y-3">
+            <div dangerouslySetInnerHTML={{ __html: html }} className="prose max-w-none text-gray-700 space-y-2" />
+            
+            {content.sources.length > 0 && (
+                <div className="pt-4 border-t border-gray-100 mt-4">
+                    <h4 className="text-xs font-semibold text-gray-500 mb-1">Sources:</h4>
+                    <ul className="list-disc list-inside space-y-1 text-xs text-gray-400">
+                        {content.sources.map((s, i) => (
+                            <li key={i}>
+                                <a href={s.uri} target="_blank" rel="noopener noreferrer" className="hover:underline">
+                                    {s.title || s.uri}
+                                </a>
+                            </li>
+                        ))}
+                    </ul>
+                </div>
+            )}
+        </div>
+    );
+  };
+
+  const InsightModal = () => {
+    if (!insightModal.isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
+                <div className="flex justify-between items-start border-b pb-3 mb-4">
+                    <h3 className="text-xl font-bold text-indigo-700">
+                        ✨ Platform Insight: {insightModal.title}
+                    </h3>
+                    <button 
+                        onClick={() => setInsightModal({ ...insightModal, isOpen: false, content: null, error: null, title: '' })}
+                        className="text-gray-400 hover:text-gray-600 transition"
+                    >
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <InsightContent content={insightModal.content} />
+            </div>
+        </div>
+    );
+  };
+
+  const ConfirmModal = () => {
+    if (!confirmModal.isOpen || !confirmModal.linkToDelete) return null;
+    const link = confirmModal.linkToDelete;
+
+    return (
+        <div className="fixed inset-0 bg-red-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6">
+                <h3 className="text-xl font-bold text-red-700 mb-3">
+                    Confirm Deletion
+                </h3>
+                <p className="text-gray-700 mb-6">
+                    Are you sure you want to permanently delete the platform: 
+                    <span className="font-semibold text-red-600 block truncate mt-1">{link.title}?</span>
+                    This action cannot be undone.
+                </p>
+                <div className="flex justify-end space-x-3">
+                    <button 
+                        onClick={() => setConfirmModal({ isOpen: false, linkToDelete: null })}
+                        className="px-4 py-2 text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition font-medium"
+                    >
+                        Cancel
+                    </button>
+                    <button 
+                        onClick={handleConfirmDelete}
+                        className="px-4 py-2 text-white bg-red-600 rounded-lg hover:bg-red-700 transition font-bold shadow-md"
+                    >
+                        Delete Permanently
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+  };
+
+
+  const LinkCard = ({ link }) => (
+    // Note: Reverted background to solid white for better contrast on the dark StarryBackground
+    <div className="bg-white p-4 rounded-xl shadow-lg hover:shadow-xl transition duration-300 flex flex-col justify-between">
+      <div>
+        <h3 className="text-lg font-semibold text-gray-800 truncate mb-1" title={link.title}>
+          <a 
+            href={link.url} 
+            target="_blank" 
+            rel="noopener noreferrer" 
+            className="text-indigo-600 hover:text-indigo-700 transition"
+          >
+            {link.title}
+          </a>
+        </h3>
+        <p className="text-sm text-gray-500 mb-2 truncate" title={link.url}>
+          {link.domain}
+        </p>
+
+        {/* Display the note */}
+        {link.note && (
+            <p className="text-sm text-gray-700 italic mb-3 border-l-2 border-indigo-400 pl-3">
+                {link.note}
+            </p>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-2 mb-3">
+        {link.tags.map((tag, index) => (
+          <span 
+            key={index} 
+            className="text-xs bg-indigo-100 text-indigo-700 py-1 px-3 rounded-full cursor-pointer hover:bg-indigo-200"
+            onClick={() => setSearchTerm(tag)}
+          >
+            #{tag}
+          </span>
+        ))}
+      </div>
+
+      <div className="flex flex-col space-y-2 pt-2 border-t border-gray-100">
+        <p className="text-xs text-gray-400">
+            Added: {link.createdAt ? new Date(link.createdAt).toLocaleDateString() : 'N/A'}
+        </p>
+        <div className="flex justify-between items-center space-x-2">
+            {/* New Gemini Insight Button */}
+            <button
+              onClick={() => handleGenerateInsight(link)}
+              className="flex-1 text-sm bg-purple-100 text-purple-700 hover:bg-purple-200 p-2 rounded-lg font-medium transition"
+              title="Get AI-powered analysis and suggested action for this platform"
+            >
+              ✨ Get Insight
+            </button>
+            
+            {/* Delete Button - Now opens the custom modal */}
+            <button
+              onClick={() => handleDeleteLink(link)}
+              className="p-2 text-red-500 hover:text-red-700 transition duration-150 rounded-lg hover:bg-red-50"
+              title="Delete Link"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+            </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    // Wrap everything in a React Fragment to allow StarryBackground outside the main div
+    <>
+      {/* 1. Starry Background component (Assuming it's in src/components/StarryBackground.jsx) */}
+      <StarryBackground /> 
+      
+      {/* 2. Main content wrapper (Added relative positioning to ensure it's above the fixed background) */}
+      <div className="min-h-screen font-sans p-4 sm:p-8 relative z-10" 
+           style={{ backgroundColor: 'transparent' }}> 
+        <script src="https://cdn.tailwindcss.com"></script>
+        {/* ADDED CUSTOM CSS HERE */}
+        <style>{`
+          @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+          body { font-family: 'Inter', sans-serif; background-color: black; }
+          
+          .gemini-chat textarea {
+            width: 100%;
+            height: 100px;
+            margin-top: 1rem;
+            padding: 0.75rem;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+          }
+          .gemini-chat button {
+            margin-top: 0.5rem;
+            background-color: #007bff;
+            color: white;
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 6px;
+          }
+          .gemini-reply {
+            margin-top: 1rem;
+            background-color: #f5f5f5;
+            padding: 1rem;
+            border-radius: 6px;
+            color: #333; /* Ensure text is visible on light background */
+          }
+
+        `}</style>
+        
+        <header className="mb-8 border-b pb-4">
+          <h1 className="text-4xl font-bold text-white">
+            The Collector
+          </h1>
+          <p className="text-gray-300 mt-1">
+            Save, tag, and organize the platforms you need to check later. Now with AI insights.
+          </p>
+          <div className="mt-2 text-sm text-gray-400">
+            User ID: <span className="font-mono text-white bg-gray-700 p-1 rounded-md text-xs">{userId || 'Loading...'}</span>
+          </div>
+        </header>
+        
+        {error && (
+          <div className="bg-red-600 bg-opacity-20 border border-red-400 text-red-100 px-4 py-3 rounded-xl mb-6 shadow-sm" role="alert">
+            <p className="font-bold">Error</p>
+            <p className="text-sm">{error}</p>
+          </div>
+        )}
+
+        {/* Input Form Section */}
+        {/* Adjusted to use solid background for form for better contrast */}
+        <section className="bg-white p-6 rounded-2xl shadow-xl mb-10 border border-gray-100">
+          <h2 className="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Add New Platform</h2>
+          <form onSubmit={handleAddLink}>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-4">
+                  <input
+                      type="url"
+                      value={newUrl}
+                      onChange={(e) => setNewUrl(e.target.value)}
+                      placeholder="Platform URL (e.g., https://awesome.tool)"
+                      required
+                      className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition shadow-sm text-gray-900"
+                      disabled={isAdding || !isAuthReady}
+                  />
+                  <input
+                      type="text"
+                      value={newTitle}
+                      onChange={(e) => setNewTitle(e.target.value)}
+                      placeholder="Optional Title (e.g., Awesome Tool Name)"
+                      className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition shadow-sm text-gray-900"
+                      disabled={isAdding || !isAuthReady}
+                  />
+              </div>
+              <div className="space-y-4"> 
+                  <input
+                      type="text"
+                      value={newNote}
+                      onChange={(e) => setNewNote(e.target.value)}
+                      placeholder="One-line note/description (e.g., Use this for reporting only)"
+                      className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition shadow-sm text-gray-900"
+                      disabled={isAdding || !isAuthReady}
+                  />
+                  <input
+                      type="text"
+                      value={newTagsString}
+                      onChange={(e) => setNewTagsString(e.target.value)}
+                      placeholder="Tags (comma separated: productivity, design, research)"
+                      className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition shadow-sm text-gray-900"
+                      disabled={isAdding || !isAuthReady}
+                  />
+              </div>
+            </div>
+            <div className="mt-4">
+              <button
+                  type="submit"
+                  className={`w-full p-3 rounded-lg font-bold transition duration-300 flex justify-center items-center ${
+                    isAdding || !isAuthReady || !newUrl.trim()
+                      ? 'bg-indigo-300 text-indigo-100 cursor-not-allowed'
+                      : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-md hover:shadow-lg'
+                  }`}
+                  disabled={isAdding || !isAuthReady || !newUrl.trim()}
+              >
+                  {isAdding ? (
+                    <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                  ) : 'Save Platform'}
+              </button>
+            </div>
+          </form>
+        </section>
+
+        {/* Link List Section */}
+        <section>
+          <div className="flex flex-col sm:flex-row justify-between items-center mb-6 gap-4">
+            <h2 className="text-2xl font-semibold text-white">Saved Platforms ({filteredLinks.length})</h2>
+            <input
+              type="text"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              placeholder="Search by Title, URL, Note, or Tag..."
+              className="w-full sm:w-80 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition shadow-sm text-gray-900"
+            />
+          </div>
+
+          {isLoading && (
+            <div className="flex justify-center items-center h-48">
+              <svg className="animate-spin h-8 w-8 text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span className="ml-3 text-lg text-gray-400">Loading links...</span>
+            </div>
+          )}
+
+          {!isLoading && filteredLinks.length === 0 && (
+            <div className="text-center p-12 bg-white bg-opacity-90 rounded-xl shadow-lg border border-gray-300">
+              <p className="text-gray-600 text-lg">
+                {searchTerm 
+                  ? `No platforms found matching "${searchTerm}".` 
+                  : "You haven't saved any platforms yet. Add your first link above!"
+                }
+              </p>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+            {filteredLinks.map(link => (
+              <LinkCard key={link.id} link={link} />
+            ))}
+          </div>
+        </section>
+        
+        {/* Modals */}
+        <InsightModal />
+        <ConfirmModal />
+
+        <footer className="mt-12 text-center text-sm text-gray-500 border-t pt-4 border-gray-700">
+          The Collector powered by Gemini and Firestore.
+        </footer>
+      </div>
+    </>
+  );
+};
+
+export default App;
